@@ -5,6 +5,7 @@ import com.willfp.ecoarmor.api.event.PlayerArmorSetUnequipEvent
 import com.willfp.ecoarmor.plugin
 import com.willfp.ecoarmor.sets.ArmorSlot.Companion.getSlot
 import com.willfp.ecoarmor.upgrades.Tier
+import com.willfp.ecoarmor.upgrades.TierProperties
 import com.willfp.ecoarmor.upgrades.Tiers
 import com.willfp.libreforge.Holder
 import com.willfp.libreforge.ItemProvidedHolder
@@ -330,6 +331,60 @@ object ArmorUtils {
     }
 
     /**
+     * Get the ids of every tier currently applied to an item, oldest first.
+     *
+     * For an item whose current tier is non-additive, this is a single-element
+     * list matching [getTier]. For an item with additive tiers stacked, this
+     * lists every tier applied so far, in application order (may contain
+     * duplicates if the same additive tier was stacked more than once).
+     *
+     * @param meta The item to check.
+     * @return The applied tier ids.
+     */
+    @JvmStatic
+    fun getAppliedTierIds(meta: ItemMeta): List<String> {
+        val stacked = meta.persistentDataContainer.get(
+            plugin.namespacedKeyFactory.create("tiers"),
+            PersistentDataType.STRING
+        )
+        if (stacked != null) {
+            return stacked.split(",").filter { it.isNotBlank() }
+        }
+        val single = meta.persistentDataContainer.get(
+            plugin.namespacedKeyFactory.create("tier"),
+            PersistentDataType.STRING
+        )
+        return if (single != null) listOf(single) else emptyList()
+    }
+
+    /**
+     * Get every tier currently applied to an item, oldest first.
+     *
+     * @param meta The item to check.
+     * @return The applied tiers.
+     */
+    @JvmStatic
+    fun getAppliedTiers(meta: ItemMeta): List<Tier> {
+        return getAppliedTierIds(meta).mapNotNull { Tiers.getByID(it) }
+    }
+
+    /**
+     * Check whether an additive tier can still be applied to an item without
+     * exceeding its [Tier.stackLimit].
+     *
+     * @param itemStack The item to check.
+     * @param tier The additive tier being applied.
+     * @return True if applying would not exceed the tier's stack limit.
+     */
+    @JvmStatic
+    fun canApplyAdditiveTier(itemStack: ItemStack, tier: Tier): Boolean {
+        val meta = itemStack.itemMeta ?: return false
+        if (tier.stackLimit < 0) return true
+        val applied = getAppliedTierIds(meta).count { it == tier.id }
+        return applied < tier.stackLimit
+    }
+
+    /**
      * Get tier on item.
      *
      * @param itemStack The item to check.
@@ -386,11 +441,51 @@ object ArmorUtils {
         tier: Tier
     ) {
         val meta = itemStack.itemMeta ?: return
-        setTierKey(meta, tier)
         val slot = getSlot(itemStack) ?: return
-
         val props = tier.properties[slot] ?: return
 
+        if (tier.additive) {
+            if (!canApplyAdditiveTier(itemStack, tier)) return
+
+            val existingIds = getAppliedTierIds(meta).toMutableList()
+            existingIds.add(tier.id)
+
+            setTierKey(meta, tier)
+            meta.persistentDataContainer.set(
+                plugin.namespacedKeyFactory.create("tiers"),
+                PersistentDataType.STRING,
+                existingIds.joinToString(",")
+            )
+
+            removeAllTierAttributeModifiers(meta)
+
+            val combinedProps = sumProperties(
+                existingIds.mapNotNull { Tiers.getByID(it) }.mapNotNull { it.properties[slot] }
+            )
+
+            addTierModifiers(meta, slot, combinedProps)
+
+            itemStack.itemMeta = meta
+            return
+        }
+
+        meta.persistentDataContainer.remove(plugin.namespacedKeyFactory.create("tiers"))
+        setTierKey(meta, tier)
+
+        removeAllTierAttributeModifiers(meta)
+
+        addTierModifiers(meta, slot, props)
+
+        itemStack.itemMeta = meta
+    }
+
+    /**
+     * Remove every attribute modifier this plugin may have added for a tier,
+     * so stats can be recalculated from scratch.
+     *
+     * @param meta The meta to mutate.
+     */
+    private fun removeAllTierAttributeModifiers(meta: ItemMeta) {
         meta.removeAttributeModifier(Attribute.ARMOR)
         meta.removeAttributeModifier(Attribute.ARMOR_TOUGHNESS)
         meta.removeAttributeModifier(Attribute.KNOCKBACK_RESISTANCE)
@@ -408,7 +503,59 @@ object ArmorUtils {
         meta.removeAttributeModifier(Attribute.SAFE_FALL_DISTANCE)
         meta.removeAttributeModifier(Attribute.ENTITY_INTERACTION_RANGE)
         meta.removeAttributeModifier(Attribute.BLOCK_INTERACTION_RANGE)
+    }
 
+    /**
+     * Sum a list of tier stat blocks into a single combined stat block, treating
+     * unset fields as 0. Used so stacked additive tiers show one recalculated
+     * attribute modifier per attribute instead of one per application.
+     *
+     * @param propsList The stat blocks to combine.
+     * @return The combined stat block.
+     */
+    private fun sumProperties(propsList: List<TierProperties>): TierProperties {
+        fun sum(selector: (TierProperties) -> Int?) = propsList.sumOf { selector(it) ?: 0 }
+
+        return TierProperties(
+            armor = sum { it.armor },
+            toughness = sum { it.toughness },
+            knockbackResistance = sum { it.knockbackResistance },
+            speedPercentage = sum { it.speedPercentage },
+            attackSpeedPercentage = sum { it.attackSpeedPercentage },
+            attackDamagePercentage = sum { it.attackDamagePercentage },
+            attackKnockbackPercentage = sum { it.attackKnockbackPercentage },
+            maxHealth = sum { it.maxHealth },
+            attackDamageFlat = sum { it.attackDamageFlat },
+            attackSpeedFlat = sum { it.attackSpeedFlat },
+            jumpStrength = sum { it.jumpStrength },
+            gravityPercentage = sum { it.gravityPercentage },
+            burningTimePercentage = sum { it.burningTimePercentage },
+            explosionKnockbackResistance = sum { it.explosionKnockbackResistance },
+            oxygenBonus = sum { it.oxygenBonus },
+            movementEfficiency = sum { it.movementEfficiency },
+            safeFallDistance = sum { it.safeFallDistance },
+            entityInteractionRangePercentage = sum { it.entityInteractionRangePercentage },
+            blockInteractionRangePercentage = sum { it.blockInteractionRangePercentage }
+        )
+    }
+
+    /**
+     * Attach a tier's attribute modifiers to an item's meta.
+     *
+     * Modifier keys are per-attribute-per-slot only (not per-tier), so callers
+     * must pass the already-combined stat block for every tier applied to the
+     * item, and clear any previous modifiers first via
+     * [removeAllTierAttributeModifiers].
+     *
+     * @param meta The meta to mutate.
+     * @param slot The armor slot the item occupies.
+     * @param props The combined stat block for that slot.
+     */
+    private fun addTierModifiers(
+        meta: ItemMeta,
+        slot: ArmorSlot,
+        props: TierProperties
+    ) {
         val slotGroup = when (slot.slot) {
             org.bukkit.inventory.EquipmentSlot.HEAD -> EquipmentSlotGroup.HEAD
             org.bukkit.inventory.EquipmentSlot.CHEST -> EquipmentSlotGroup.CHEST
@@ -463,8 +610,6 @@ object ArmorUtils {
         val fracScaler: (Int) -> Double = { it / 100.0 }
         addModifier(Attribute.KNOCKBACK_RESISTANCE, props.knockbackResistance, AttributeModifier.Operation.ADD_NUMBER, "", fracScaler)
         addModifier(Attribute.EXPLOSION_KNOCKBACK_RESISTANCE, props.explosionKnockbackResistance, AttributeModifier.Operation.ADD_NUMBER, "", fracScaler)
-
-        itemStack.itemMeta = meta
     }
 
     /**
